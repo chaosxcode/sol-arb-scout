@@ -1,0 +1,13 @@
+node_modules/
+
+# secrets - never commit
+# .env holds the Helius RPC url and Jupiter API key
+# wallet.json holds the burner PRIVATE KEY
+.env
+wallet.json
+
+# machine-local state
+.alt.json
+live.log
+live.prev*.log
+status.sh
