@@ -12,7 +12,7 @@ import { Connection, PublicKey } from '@solana/web3.js';
 import { CFG } from './config.js';
 import { SOL, TOKENS } from './tokens.js';
 import {
-  calibrate, cpPrice, decodePrice, discoverPools, ensureBinArrays, initModel, initPool, isCp,
+  calibrate, cpPrice, decodePrice, discoverPools, ensureBinArrays, unsubscribeBinArrays, initModel, initPool, isCp,
   modelOf, swapOut, tokenAmount, updateModel, type Pool,
 } from './pools.js';
 import { refreshHot } from './build.js';
@@ -80,6 +80,7 @@ export function dropToken(conn: Connection, symbol: string): boolean {
   const b = books.get(symbol);
   if (!b) return false;
   for (const id of b.subIds ?? []) conn.removeAccountChangeListener(id).catch(() => {});
+  for (const p of b.pools) if (p.dex === 'meteora-dlmm') unsubscribeBinArrays(conn, p);
   books.delete(symbol);
   return true;
 }

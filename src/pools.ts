@@ -303,25 +303,73 @@ function binArrayPda(lbPair: PublicKey, index: number): PublicKey {
   const idx = Buffer.alloc(8); idx.writeBigInt64LE(BigInt(index));
   return PublicKey.findProgramAddressSync([Buffer.from('bin_array'), lbPair.toBuffer(), idx], DLMM_PROGRAM)[0];
 }
-export async function ensureBinArrays(conn: Connection, p: Pool, maxAgeMs = 1500): Promise<boolean> {
+function parseBinArray(data: Buffer | null): { x: number; y: number }[] {
+  const bins: { x: number; y: number }[] = [];
+  if (data && data.length >= BIN_ARRAY_HEADER + BINS_PER_ARRAY * BIN_SIZE) {
+    for (let b = 0; b < BINS_PER_ARRAY; b++) {
+      const o = BIN_ARRAY_HEADER + b * BIN_SIZE;
+      bins.push({ x: Number(u64(data, o)), y: Number(u64(data, o + 8)) });
+    }
+  } // missing array = no liquidity there (bins stay empty)
+  return bins;
+}
+
+// ---- Bin arrays are SUBSCRIBED, not polled ----------------------------------
+// Polling them (getMultipleAccountsInfo per DLMM pool every ~1.5s) put ~20 req/s
+// into a 10 req/s RPC tier once the watch list grew: 850+ 429s in one session,
+// each one stalling pricing, the blockhash pump and landing checks. Bin arrays
+// only change when someone trades or moves liquidity, so an account
+// subscription is both cheaper and fresher. The subscribed window is the
+// active array ±1; it slides as activeId moves. A one-off fetch fills the
+// window on (re)subscribe; after that, zero RPC.
+const binSubs = new Map<string, Map<number, number>>(); // pool -> (array index -> ws sub id)
+let subscribedConn: Connection | null = null;
+
+async function subscribeWindow(conn: Connection, p: Pool): Promise<void> {
+  const m = models.get(p);
+  if (!m?.dlmm) return;
+  const c = binArrayIndex(m.dlmm.activeId);
+  const want = new Set([c - 1, c, c + 1]);
+  const key = p.address.toBase58();
+  const subs = binSubs.get(key) ?? new Map<number, number>();
+  binSubs.set(key, subs);
+  // drop subscriptions that slid out of the window
+  for (const [i, id] of [...subs]) if (!want.has(i)) { subs.delete(i); void conn.removeAccountChangeListener(id).catch(() => {}); m.dlmm.arrays.delete(i); }
+  const missing = [...want].filter((i) => !subs.has(i));
+  if (!missing.length) return;
+  // seed with one fetch, then subscribe for every subsequent change
+  const infos = await conn.getMultipleAccountsInfo(missing.map((i) => binArrayPda(p.address, i)), 'processed');
+  missing.forEach((i, k) => {
+    m.dlmm!.arrays.set(i, { at: Date.now(), bins: parseBinArray(infos[k]?.data ?? null) });
+    noteBinArray(p.address, i, !!infos[k]);
+    const id = conn.onAccountChange(binArrayPda(p.address, i), (ai) => {
+      m.dlmm!.arrays.set(i, { at: Date.now(), bins: parseBinArray(ai.data) });
+      noteBinArray(p.address, i, true);
+    }, 'processed');
+    subs.set(i, id);
+  });
+}
+
+// Tear down a pool's bin-array subscriptions (token dropped by rotation).
+export function unsubscribeBinArrays(conn: Connection, p: Pool): void {
+  const key = p.address.toBase58();
+  const subs = binSubs.get(key);
+  if (!subs) return;
+  for (const id of subs.values()) void conn.removeAccountChangeListener(id).catch(() => {});
+  binSubs.delete(key);
+}
+void subscribedConn;
+
+// Called from the pricing path. Fast path (window already live): no RPC.
+export async function ensureBinArrays(conn: Connection, p: Pool, _maxAgeMs = 1500): Promise<boolean> {
   const m = models.get(p);
   if (!m?.dlmm) return false;
+  subscribedConn = conn;
   const c = binArrayIndex(m.dlmm.activeId);
-  const want = [c - 1, c, c + 1].filter((i) => { const a = m.dlmm!.arrays.get(i); return !a || Date.now() - a.at > maxAgeMs; });
-  if (!want.length) return true;
-  const infos = await conn.getMultipleAccountsInfo(want.map((i) => binArrayPda(p.address, i)), 'processed');
-  want.forEach((i, k) => {
-    const info = infos[k];
-    const bins: { x: number; y: number }[] = [];
-    if (info && info.data.length >= BIN_ARRAY_HEADER + BINS_PER_ARRAY * BIN_SIZE) {
-      for (let b = 0; b < BINS_PER_ARRAY; b++) {
-        const o = BIN_ARRAY_HEADER + b * BIN_SIZE;
-        bins.push({ x: Number(u64(info.data, o)), y: Number(u64(info.data, o + 8)) });
-      }
-    } // missing array = no liquidity there (bins stay empty)
-    m.dlmm!.arrays.set(i, { at: Date.now(), bins });
-    noteBinArray(p.address, i, !!info); // keep the tx builder's view of existing arrays fresh
-  });
+  const subs = binSubs.get(p.address.toBase58());
+  const live = subs && [c - 1, c, c + 1].every((i) => subs.has(i) && m.dlmm!.arrays.has(i));
+  if (live) return true;
+  await subscribeWindow(conn, p);
   return true;
 }
 function binOf(m: PoolModel, id: number): { x: number; y: number } | null {

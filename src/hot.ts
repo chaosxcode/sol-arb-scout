@@ -41,7 +41,7 @@ export const blockhashAgeMs = () => (blockhashAt ? Date.now() - blockhashAt : -1
 let balanceLamports = -1;
 let balanceAt = 0;
 let balTimer: NodeJS.Timeout | null = null;
-export function startBalancePump(conn: Connection, owner: import('@solana/web3.js').PublicKey, intervalMs = 4000): void {
+export function startBalancePump(conn: Connection, owner: import('@solana/web3.js').PublicKey, intervalMs = 8000): void {
   if (balTimer) return;
   const tick = async () => {
     try { balanceLamports = await conn.getBalance(owner, 'confirmed'); balanceAt = Date.now(); } catch { /* keep last */ }
