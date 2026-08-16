@@ -411,9 +411,17 @@ export function staticKeysFor(a: LocalPoolAccts, user: PublicKey): PublicKey[] {
   const [mint, prog] = tokenMintOf(a);
   keys.push(mint, getAssociatedTokenAddressSync(mint, user, false, prog));
   if (a.kind === 'pump') {
-    const c = commonAccounts(a.p, user);
-    keys.push(a.p.pool, a.p.baseVault, a.p.quoteVault, PUMP_GLOBAL_CONFIG, PUMP_PROTOCOL_FEE_RECIPIENT, c.protocolFeeAta, c.eventAuthority, PUMP_AMM,
-      c.creatorVaultAta, c.creatorVaultAuth, c.globalVol, c.userVol, c.feeConfig, PUMP_FEE_PROGRAM, PUMP_OPTIONAL_PLACEHOLDER, PUMP_FEE_SHARE, c.feeShareAta);
+    // Prefer the LIVE CPI template's accounts (pool_v2, fee-tier account and its
+    // ATA, cashback ATA...) — those are what the leg actually references. Fall
+    // back to the derivable set if no template has been fetched yet.
+    const tpl = pumpTemplates.get(a.p.pool.toBase58())?.buy;
+    if (tpl) {
+      keys.push(...tpl.keys.filter((k) => !k.equals(user)));
+    } else {
+      const c = commonAccounts(a.p, user);
+      keys.push(a.p.pool, a.p.baseVault, a.p.quoteVault, PUMP_GLOBAL_CONFIG, PUMP_PROTOCOL_FEE_RECIPIENT, c.protocolFeeAta, c.eventAuthority, PUMP_AMM,
+        c.creatorVaultAta, c.creatorVaultAuth, c.globalVol, c.userVol, c.feeConfig, PUMP_FEE_PROGRAM);
+    }
   } else if (a.kind === 'ray') {
     keys.push(a.p.pool, a.p.baseVault, a.p.quoteVault, RAY_V4, RAY_V4_AUTHORITY);
   } else if (a.kind === 'wp') {
@@ -593,15 +601,27 @@ export function pumpTemplateSizes(): string { return [...pumpTemplates.entries()
 
 // Pre-warm / refresh PumpSwap CPI templates so fire-time builds never wait on Jupiter.
 export async function warmPumpTemplates(conn: Connection, user: PublicKey, pools: Array<{ dex: string; address: PublicKey }>, force = false): Promise<void> {
-  for (const p of pools) {
-    if (p.dex !== 'pumpswap') continue;
-    try {
-      const acc = await loadPumpPool(conn, p.address);
-      // Replace-on-success: the old template stays live until the new one lands,
-      // so a refresh never opens a window where the leg has no template.
-      const t = await pumpTemplate(conn, acc, user, 'buy', force);
-      console.log(`  pump template ${p.address.toBase58().slice(0, 6)}…: ${t ? `${t.keys.length} accts` : 'FAILED — pump legs for this pool go via Jupiter until the next refresh'}`);
-    } catch (e) { console.warn(`  pump template ${p.address.toBase58().slice(0, 6)}… failed: ${(e as Error).message.slice(0, 80)}`); }
-    await new Promise((r) => setTimeout(r, 1200));
+  // Startup hammers Jupiter (discovery, calibration, templates), so first tries
+  // often 429. Retry the failures a couple of times with a pause rather than
+  // leaving the highest-yield tokens on the slower Jupiter path for 4 minutes.
+  let pending = pools.filter((p) => p.dex === 'pumpswap');
+  for (let attempt = 1; attempt <= 3 && pending.length; attempt++) {
+    if (attempt > 1) await new Promise((r) => setTimeout(r, 12_000));
+    const failed: typeof pending = [];
+    for (const p of pending) {
+      try {
+        const acc = await loadPumpPool(conn, p.address);
+        // Replace-on-success: the old template stays live until the new one lands,
+        // so a refresh never opens a window where the leg has no template.
+        const t = await pumpTemplate(conn, acc, user, 'buy', force);
+        if (t) console.log(`  pump template ${p.address.toBase58().slice(0, 6)}…: ${t.keys.length} accts${attempt > 1 ? ` (retry ${attempt})` : ''}`);
+        else failed.push(p);
+      } catch { failed.push(p); }
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+    pending = failed;
+    if (pending.length && attempt === 3) {
+      for (const p of pending) console.log(`  pump template ${p.address.toBase58().slice(0, 6)}…: FAILED after 3 tries — pump legs for this pool go via Jupiter until the next refresh`);
+    }
   }
 }

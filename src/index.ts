@@ -143,14 +143,16 @@ async function main() {
           .flatMap((b) => b.pools.filter((p) => isLocalDex(p.dex, p.token2022)))
           .map((p) => ({ p, fee: modelOf(p)?.fee ?? 1 }))
           .sort((a, b) => a.fee - b.fee);
+        // PumpSwap CPI templates FIRST (from Jupiter+simulation) so the lookup table
+        // below can include the exact accounts a pump leg references — that is what
+        // lets a pump<->DLMM round trip fit in ONE transaction instead of a 2-tx bundle.
+        const livePumpPools = () => [...books.values()].flatMap((b) => b.pools.filter((p) => p.dex === 'pumpswap'));
+        await warmPumpTemplates(conn, wallet.publicKey, livePumpPools());
         const keys: import('@solana/web3.js').PublicKey[] = [];
         for (const { p } of ranked) {
           try { keys.push(...staticKeysFor(await loadLocalPool(conn, p.dex, p.address), wallet.publicKey)); } catch { /* skip pool */ }
         }
         setAlt(await ensureAlt(conn, wallet, keys));
-        // PumpSwap CPI templates (from Jupiter+simulation): warm now, refresh every 4 min.
-        const livePumpPools = () => [...books.values()].flatMap((b) => b.pools.filter((p) => p.dex === 'pumpswap'));
-        await warmPumpTemplates(conn, wallet.publicKey, livePumpPools());
         // Refresh over the LIVE list so pools adopted by rotation are covered too.
         setInterval(() => void warmPumpTemplates(conn, wallet.publicKey, livePumpPools(), true), 240_000);
 
