@@ -20,7 +20,12 @@ export const CFG = {
   // DEXes Jupiter must not route through. HumidiFi's accounts include Jito's
   // validator vote account (J1to1yuf…), and Jito rejects any bundle that locks
   // a vote account -> routes via HumidiFi can never land as a bundle.
-  jupExcludeDexes: str('JUP_EXCLUDE_DEXES', 'HumidiFi'),
+  // HumidiFi's accounts include Jito's validator vote account, so bundles routed
+  // through it are rejected outright. Nexus is an RFQ venue that quoted a price
+  // it then refused to honour ("No price for side offer") AND produced a wildly
+  // wrong quote (+3,586,618 bps) that our poll path briefly believed. Both are
+  // venues that cost us sends without ever being fillable.
+  jupExcludeDexes: str('JUP_EXCLUDE_DEXES', 'HumidiFi,Nexus'),
   // Adaptive scheduling: pairs whose last edge was >= HOT_BPS scan every cycle;
   // between HOT and COLD every 3rd; below COLD every 8th. Same request budget,
   // more looks at the pairs that can actually fire.
@@ -63,6 +68,11 @@ export const CFG = {
   // tipped median 2.1k, p75 7.7k, max 14.8k lamports. Above that we're only
   // donating profit to the validator; cap the bid.
   tipMaxLamports: num('TIP_MAX_LAMPORTS', 15_000),
+  // Upper bound on a proportional bid. Big edges deserve big bids — winning 40%
+  // of a 600k-lamport profit beats losing 100% of it.
+  tipCeilingLamports: num('TIP_CEILING_LAMPORTS', 400_000),
+  // Reject quotes claiming more than this multiple of the input (pricing faults).
+  sanityMaxMultiple: num('SANITY_MAX_MULTIPLE', 1),
   maxInflight: num('MAX_INFLIGHT', 3),
   // TRADE_SIZE_SOL is a CAP. Each opportunity is sized by the local engine to
   // whatever maximises profit on that specific dislocation, down to this floor.

@@ -194,6 +194,13 @@ async function main() {
   async function onCandidate(opp: Opportunity, source: 'poll' | 'watch' = 'poll'): Promise<void> {
     // Poll-path hits on tokens the on-chain engine covers must be backed by local math
     // (forensics: unbacked poll hits were phantom edges from Jupiter's cache).
+    // Any quote claiming a multiple of the input is a data fault, not a windfall.
+    // This applies to EVERY token — the local-agreement check below only covers
+    // tokens the watcher tracks, and XST slipped through it after being dropped.
+    if (opp.outLamports > opp.inLamports * 2n) {
+      console.warn(`${ts()} ${opp.symbol.padEnd(6)} implausible quote (${(Number(opp.outLamports) / Number(opp.inLamports)).toFixed(1)}x) — ignoring`);
+      return;
+    }
     if (source === 'poll' && books.has(opp.symbol)) {
       const loc = await localRoundTrip(conn, opp.symbol).catch(() => null);
       if (loc && Number.isFinite(loc.best) && loc.best < CFG.pollAgreeBps) {

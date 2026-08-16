@@ -47,11 +47,25 @@ export interface Plan {
 // bid most of the edge), snapped up to the nearest landed-tip percentile when
 // that still fits. Never below what leaves MIN_NET_LAMPORTS.
 export function planTrade(opp: Opportunity, floor: TipFloor): Plan | null {
+  // A round trip cannot plausibly return many multiples of its input. When the
+  // local model emits something like +3,586,618 bps (observed on XST), that is a
+  // pricing fault — stale bin data, a decimals mismatch, an empty reserve — not
+  // a windfall. Refuse it loudly rather than spend a send on garbage.
+  if (opp.outLamports > opp.inLamports * BigInt(1 + CFG.sanityMaxMultiple)) {
+    console.warn(`  ⚠ ${opp.symbol}: implausible quote (${(Number(opp.outLamports) / Number(opp.inLamports)).toFixed(1)}x return) — pricing fault, ignoring`);
+    return null;
+  }
   const grossWorst = opp.minOutLamports - opp.inLamports;
   const grossExpected = opp.outLamports - opp.inLamports;
   const room = grossWorst - BigInt(BASE_FEES_LAMPORTS) - BigInt(CFG.minNetLamports);
   if (room <= 0n) return null;
-  const budget = Math.min(CFG.tipMaxLamports, Number((room * BigInt(Math.round(CFG.tipShare * 100))) / 100n));
+  // Jito is an auction. Bidding a flat 15k into an opportunity worth 600k+ is
+  // how you lose to someone bidding 60% of it — the flat cap came from majors
+  // forensics (tiny edges, 1-15k tips) and is the wrong reference for a fat
+  // long-tail edge. Bid a SHARE of the actual profit; the cap is only a floor-
+  // level sanity bound for tiny trades, applied as a maximum of the two.
+  const share = Number((room * BigInt(Math.round(CFG.tipShare * 100))) / 100n);
+  const budget = Math.max(Math.min(CFG.tipMaxLamports, share), Math.min(share, CFG.tipCeilingLamports));
   let tip = Math.max(1000, Math.floor(budget)); let tipRung: Plan['tipRung'] = 'bid';
   for (const [r, v] of [['p95', floor.p95], ['p75', floor.p75], ['p50', floor.p50], ['p25', floor.p25]] as const) {
     if (v <= budget && v > tip) { tip = v; tipRung = r; }
