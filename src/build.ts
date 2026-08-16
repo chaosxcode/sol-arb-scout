@@ -600,7 +600,7 @@ export async function warmPumpTemplates(conn: Connection, user: PublicKey, pools
       // Replace-on-success: the old template stays live until the new one lands,
       // so a refresh never opens a window where the leg has no template.
       const t = await pumpTemplate(conn, acc, user, 'buy', force);
-      console.log(`  pump template ${p.address.toBase58().slice(0, 6)}…: ${t ? `${t.keys.length} accts` : 'FAILED — this pool's pump legs go via Jupiter until the next refresh'}`);
+      console.log(`  pump template ${p.address.toBase58().slice(0, 6)}…: ${t ? `${t.keys.length} accts` : 'FAILED — pump legs for this pool go via Jupiter until the next refresh'}`);
     } catch (e) { console.warn(`  pump template ${p.address.toBase58().slice(0, 6)}… failed: ${(e as Error).message.slice(0, 80)}`); }
     await new Promise((r) => setTimeout(r, 1200));
   }
