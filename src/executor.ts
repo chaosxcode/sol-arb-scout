@@ -57,7 +57,9 @@ export function planTrade(opp: Opportunity, floor: TipFloor): Plan | null {
   }
   const grossWorst = opp.minOutLamports - opp.inLamports;
   const grossExpected = opp.outLamports - opp.inLamports;
-  const room = grossWorst - BigInt(BASE_FEES_LAMPORTS) - BigInt(CFG.minNetLamports);
+  // Gate on the EXPECTED round trip, not the worst case — with a loss-tolerant
+  // min-out the "worst case" is intentionally negative and would reject everything.
+  const room = grossExpected - BigInt(BASE_FEES_LAMPORTS) - BigInt(CFG.minNetLamports);
   if (room <= 0n) return null;
   // Jito is an auction. Bidding a flat 15k into an opportunity worth 600k+ is
   // how you lose to someone bidding 60% of it — the flat cap came from majors
@@ -71,7 +73,7 @@ export function planTrade(opp: Opportunity, floor: TipFloor): Plan | null {
     if (v <= budget && v > tip) { tip = v; tipRung = r; }
   }
   if (tip > Number(room)) return null;
-  const net = grossWorst - BigInt(tip) - BigInt(BASE_FEES_LAMPORTS);
+  const net = grossExpected - BigInt(tip) - BigInt(BASE_FEES_LAMPORTS);
   if (net < BigInt(CFG.minNetLamports)) return null;
   return { tipLamports: tip, tipRung, grossWorstLamports: grossWorst, grossExpectedLamports: grossExpected, netWorstLamports: net };
 }
@@ -119,8 +121,12 @@ export async function execute(
   // fill above (input + tip + fees + min profit) is a win worth taking. This fails
   // the trade exactly when it would be unprofitable and never sooner, which is the
   // whole point of an atomic bundle. (ExceededAmountSlippageTolerance, 2026-08-16.)
-  const breakEvenOut = opp.inLamports + BigInt(plan.tipLamports + BASE_FEES_LAMPORTS + CFG.minNetLamports);
-  const floorOut = breakEvenOut < opp.minOutLamports ? breakEvenOut : opp.minOutLamports;
+  // Accept up to MAX_LOSS_BPS of loss on the round trip so the swap legs do NOT
+  // revert when the edge moves — a reverting leg makes Jito drop the whole bundle
+  // as Invalid (which is why nothing landed). We eat a few cents on the tail to
+  // guarantee inclusion; real edges still profit. Never demand break-even.
+  const lossFloor = opp.inLamports - (opp.inLamports * BigInt(CFG.maxLossBps)) / 10_000n;
+  const floorOut = lossFloor < opp.minOutLamports ? lossFloor : opp.minOutLamports;
   const needBh = localA || localB;
   const bhP = needBh ? hotBlockhash(conn).then((blockhash) => ({ blockhash })) : null;
   // Same buffered intermediate amount the signal used to judge profitability:
@@ -130,13 +136,14 @@ export async function execute(
   // on-chain minimum. Quoted at SLIPPAGE_BPS=1 that reverts (Jupiter 0x1789)
   // on any tick of movement. Rewrite the threshold on the FINAL leg to the same
   // break-even floor we use for local legs: revert only if we'd lose money.
+  // Pass Jupiter's quote UNMODIFIED to /swap. Editing the quote (otherAmountThreshold
+  // / slippageBps) produced bundles Jito rejected as Invalid — the WIF fill that
+  // actually landed used raw quotes. Slippage is controlled at quote time (SLIPPAGE_BPS).
+  // Loosen the final Jupiter leg's on-chain minimum to the loss floor so it does not
+  // revert on movement. (Re-quoting loose lands — proven by the forced round trip.)
   const legBForBuild = opp.legB && !localB ? relaxThreshold(opp.legB, floorOut) : opp.legB;
-  // A Jupiter legA must guarantee at least what legB will sell (the buffered
-  // amount); its default 1-bp minimum is tighter than that and reverts for no
-  // reason. Loosen it to the buffered amount — never below what legB needs.
-  const legAForBuild = opp.legA && !localA && opp.tokAmount ? relaxThreshold(opp.legA, slip(opp.tokAmount)) : opp.legA;
   const [aRes, bRes, bh] = await Promise.all([
-    localA ? null : buildSwapTx(legAForBuild!, user, 0),
+    localA ? null : buildSwapTx(opp.legA!, user, 0),
     localB ? null : buildSwapTx(legBForBuild!, user, { jitoTipLamports: plan.tipLamports }),
     bhP,
   ]);

@@ -73,6 +73,10 @@ export const CFG = {
   minNetLamports: num('MIN_NET_LAMPORTS', 1000),
   // Share of worst-case profit bid as Jito tip (auction: bid most of it, keep the rest).
   tipShare: num('TIP_SHARE', 0.6),
+  // Max round-trip loss tolerated on the built swaps' min-out, so a leg never
+  // reverts (a revert = Jito drops the bundle Invalid). We eat this on the tail
+  // to guarantee inclusion; profitable edges still profit.
+  maxLossBps: num('MAX_LOSS_BPS', 60),
   // Forensics 2026-08-15: bots that actually landed round trips in our windows
   // tipped median 2.1k, p75 7.7k, max 14.8k lamports. Above that we're only
   // donating profit to the validator; cap the bid.
