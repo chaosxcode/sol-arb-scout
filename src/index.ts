@@ -139,10 +139,14 @@ async function main() {
         // Never put tip accounts in the ALT (Jito requires them static).
         // Order pools cheapest-fee-first: those are the ones that can actually
         // clear a fee wall and fire, so they get the limited table space.
+        // Table space goes where it changes the outcome: PumpSwap pools FIRST — a
+        // pump leg references ~26 accounts and pump<->DLMM round trips only fit in
+        // one transaction with those in the table (DLMM<->DLMM fits without it).
+        // Then cheapest-fee-first for whatever budget remains.
         const ranked = [...books.values()]
           .flatMap((b) => b.pools.filter((p) => isLocalDex(p.dex, p.token2022)))
-          .map((p) => ({ p, fee: modelOf(p)?.fee ?? 1 }))
-          .sort((a, b) => a.fee - b.fee);
+          .map((p) => ({ p, fee: modelOf(p)?.fee ?? 1, pump: p.dex === 'pumpswap' ? 0 : 1 }))
+          .sort((a, b) => a.pump - b.pump || a.fee - b.fee);
         // PumpSwap CPI templates FIRST (from Jupiter+simulation) so the lookup table
         // below can include the exact accounts a pump leg references — that is what
         // lets a pump<->DLMM round trip fit in ONE transaction instead of a 2-tx bundle.
