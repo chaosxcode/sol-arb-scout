@@ -232,7 +232,8 @@ async function sendAndTrack(conn: Connection, txs: VersionedTransaction[], plan:
         //   PumpSwap      6041  SellSlippageExceedsMaxQuoteAmountOut (observed variant)
         //   Jupiter       6025 / 0x1789  SlippageToleranceExceeded
         //   Whirlpool/CLMM 6003 / 0x1793 AmountOutBelowMinimum
-        const transient = /6003|6040|6041|6025|0x1789|0x1793|Slippage|slippage|AmountOutBelowMinimum|ExceededAmount|insufficient funds/.test(blob);
+        //   Raydium CLMM  6018  TooLittleOutputReceived  (seen on the TRUMP 85% flash, 2026-08-16)
+        const transient = /6003|6018|6040|6041|6025|0x1789|0x1793|Slippage|slippage|AmountOutBelowMinimum|TooLittleOutput|ExceededAmount|insufficient funds/.test(blob);
         const tag = transient ? 'edge gone by sim time (transient, expected on a miss)' : '*** STRUCTURAL — investigate ***';
         console.log(`  post-send sim of ${what}: ${tag} ${JSON.stringify(sim.value.err)} :: ${logs.join(' | ').slice(0, 240)}`);
       } else {
