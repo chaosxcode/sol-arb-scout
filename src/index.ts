@@ -287,7 +287,7 @@ async function main() {
       res.landing!
         .then(async (fin) => {
           if (fin.status === 'landed') { landed++; console.log(`  ✅ LANDED ${opp.symbol} (${fin.detail})`); nudgeBalance(conn, wallet.publicKey); await reportBalance(true); }
-          else if (fin.status === 'dropped') console.log(`  ✗ ${opp.symbol} bundle not landed — lost the race, cost 0`);
+          else if (fin.status === 'dropped') console.log(`  ✗ ${opp.symbol} not landed — ${fin.detail ?? 'lost the race'} (cost 0)`);
           else console.log(`  ✗ ${opp.symbol}: ${fin.detail}`);
         })
         .catch((e) => console.warn('  landing check failed:', (e as Error).message.slice(0, 80)))

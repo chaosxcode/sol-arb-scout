@@ -17,7 +17,7 @@ import bs58 from 'bs58';
 import { readFileSync } from 'node:fs';
 import { CFG } from './config.js';
 import { buildSwapTx } from './jupiter.js';
-import { sendBundle, TIP_ACCOUNTS, type TipFloor } from './jito.js';
+import { sendBundle, bundleStatus, TIP_ACCOUNTS, type TipFloor } from './jito.js';
 import { isLocalDex, loadLocalPool, buildRoundTripTx, buildLegTx, hasPumpTemplate } from './build.js';
 import { hotBlockhash } from './hot.js';
 import type { Opportunity } from './scanner.js';
@@ -242,10 +242,13 @@ async function sendAndTrack(conn: Connection, txs: VersionedTransaction[], plan:
       }
     } catch (e) { console.log('  post-send sim failed:', (e as Error).message.slice(0, 80)); }
   })();
-  const landing = trackSignature(conn, sigB, 12_000).then((st): Result => {
+  const landing = trackSignature(conn, sigB, 12_000).then(async (st): Promise<Result> => {
     if (st.status === 'landed') return { status: 'landed', bundleId, detail: `slot ${st.slot} sig ${sigB}` };
     if (st.status === 'failed') return { status: 'error', bundleId, detail: `legB landed but errored: ${st.err}` };
-    return { status: 'dropped', bundleId, detail: 'not on chain after 12s' };
+    // Not on chain — ask Jito WHY. Landed-per-Jito but not-on-our-sig = sig mismatch;
+    // Invalid/Failed = bundle problem; still Pending/Unknown = never selected (race or tip).
+    const js = await bundleStatus(bundleId);
+    return { status: 'dropped', bundleId, detail: `not on chain after 12s; Jito says: ${js}` };
   });
   return { status: 'sent', bundleId, landing };
 }

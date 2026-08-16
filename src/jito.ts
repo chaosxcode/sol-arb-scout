@@ -84,3 +84,12 @@ export async function getTipFloor(): Promise<TipFloor> {
     return tipCache?.v ?? { p25: t, p50: t, p75: t, p95: t, ema50: t };
   }
 }
+
+// Ask Jito what actually happened to a bundle: Pending | Landed | Failed | Invalid.
+// "Accepted the send but Invalid/Failed here" == a real bundle problem, not a race.
+export async function bundleStatus(id: string): Promise<string> {
+  try {
+    const res = await rpc<{ value: { status: string }[] }>('getInflightBundleStatuses', [[id]]);
+    return res?.value?.[0]?.status ?? 'Unknown';
+  } catch (e) { return 'query-failed:' + (e as Error).message.slice(0, 40); }
+}
