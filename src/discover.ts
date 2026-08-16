@@ -24,7 +24,7 @@ async function jupList(ep: string): Promise<Array<Record<string, any>>> {
 }
 
 // Screen the current market and return tokens sorted by fee wall (cheapest first).
-export async function screenTokens(conn: Connection, exclude: Set<string>, maxToInspect = 24): Promise<Candidate[]> {
+export async function screenTokens(conn: Connection, exclude: Set<string>, maxToInspect = 32): Promise<Candidate[]> {
   const seen = new Map<string, { symbol: string; mint: string; liq: number; vol: number }>();
   for (const ep of ['toptraded/24h', 'toporganicscore/24h', 'toptrending/24h']) {
     for (const t of await jupList(ep)) {

@@ -88,7 +88,13 @@ export const CFG = {
   discoverEnabled: bool('DISCOVER', true),
   discoverIntervalMs: num('DISCOVER_INTERVAL_MS', 3_600_000),
   discoverMaxTokens: num('DISCOVER_MAX_TOKENS', 26),
-  discoverMaxWallBps: num('DISCOVER_MAX_WALL_BPS', 45),
+  // Fee wall alone turned out to be a poor predictor. Measured above-bar rates:
+  // ANSEM (wall 26) 1.5%, TOAD (wall 130) 1.3%, CATE (75) 0.4%, PUMP (20) 0.1%,
+  // MET (35) and every major (9-35) 0.0%. A high wall is fine when the token's
+  // spreads are correspondingly wild; a cheap wall on a placid token is useless.
+  // So cast a wider net here and let OBSERVED signals prune - rotation already
+  // drops tokens that produce none. (MANLET at 200 stays excluded; it earned 0%.)
+  discoverMaxWallBps: num('DISCOVER_MAX_WALL_BPS', 140),
   discoverMinLiqUsd: num('DISCOVER_MIN_LIQ_USD', 120_000),
   discoverMinVolUsd: num('DISCOVER_MIN_VOL_USD', 250_000),
   // A Jupiter-poll hit on a token the on-chain engine covers must be backed by a
