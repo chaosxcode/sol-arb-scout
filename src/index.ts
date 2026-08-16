@@ -185,8 +185,12 @@ async function main() {
               }
               // Make room by dropping the worst performers (no signals, worst edge).
               if (books.size >= CFG.discoverMaxTokens) {
+                // Never drop the cheap-fee-wall core (JUP/BONK/WIF/PUMP): small edges
+                // on these are the winnable ones — beneath snipers' notice — even
+                // when they go quiet for a while.
+                const CORE = new Set(['JUP', 'BONK', 'WIF', 'PUMP']);
                 const ranked = [...books.values()]
-                  .filter((b) => b.signals === 0)
+                  .filter((b) => b.signals === 0 && !CORE.has(b.symbol))
                   .sort((a, b) => (a.localEdgeBps || -1e9) - (b.localEdgeBps || -1e9));
                 for (const b of ranked.slice(0, Math.max(0, books.size - CFG.discoverMaxTokens + 2))) {
                   if (dropToken(conn, b.symbol)) console.log(`  rotation - ${b.symbol}: no signals, best edge ${b.localEdgeBps.toFixed(0)} bps`);
