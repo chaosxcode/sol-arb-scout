@@ -36,6 +36,10 @@ export const CFG = {
   watchStage1Bps: num('WATCH_STAGE1_BPS', 10),   // mid spread needed to bother pricing locally
   localEvalMs: num('LOCAL_EVAL_MS', 1200),        // max one local pricing per token per this
   localTriggerBps: num('LOCAL_TRIGGER_BPS', 6),   // local exact round trip needed to call Jupiter
+  // Cap on the pessimism correction (see TokenBook.biasBps). Our local view is a
+  // subset of Jupiter's routing graph; this is how far we let that gap lower the
+  // bar for asking Jupiter, without letting one strange sample spam quotes.
+  maxBiasBps: num('MAX_BIAS_BPS', 90),
   watchBlindBps: num('WATCH_BLIND_BPS', 150),     // not priceable locally but spread this big: one look
   watchCooldownMs: num('WATCH_COOLDOWN_MS', 4000),
   hotBps: num('HOT_BPS', -15),

@@ -33,6 +33,13 @@ export interface TokenBook {
   subIds?: number[];
   // accuracy tracking: local vs jupiter edge on signals
   lastJupEdge?: number;
+  // Our local engine only knows 5 DEX types and the handful of pools DexScreener
+  // reported. Jupiter routes ~30 venues and multi-hop paths we never see, so our
+  // edge is systematically PESSIMISTIC on some tokens (XST measured 86 bps low,
+  // repeatedly). Track that bias so the trigger can compensate instead of
+  // filtering out opportunities we simply cannot see locally.
+  biasBps?: number;   // EMA of (jupiter edge - local edge)
+  biasN?: number;
 }
 
 export const books = new Map<string, TokenBook>();
@@ -196,7 +203,12 @@ async function evaluate(conn: Connection, book: TokenBook, onSignal: (b: TokenBo
   book.localEdgeBps = best; book.localBuy = bestBuy; book.localSell = bestSell; book.localSizeLamports = sizeLamports;
   if (quiet || handling.has(book.symbol)) return;
 
-  const fire = Number.isFinite(best) && best >= CFG.localTriggerBps;
+  // Compensate for our known blind spots: if Jupiter has repeatedly found routes
+  // N bps better than ours on this token, a local reading of (trigger - N) is
+  // worth a Jupiter check. Bounded so a single odd sample can't open the floodgates.
+  const bias = (book.biasN ?? 0) >= 2 ? Math.max(0, Math.min(CFG.maxBiasBps, book.biasBps ?? 0)) : 0;
+  const effTrigger = CFG.localTriggerBps - bias;
+  const fire = Number.isFinite(best) && best >= effTrigger;
   // Fallback: can't price locally but the mid spread is huge — still worth one look, rarely.
   const blind = !Number.isFinite(best) && book.spreadBps >= CFG.watchBlindBps && now - book.lastSignalAt > 30_000;
   if (!fire && !blind) return;
@@ -204,13 +216,18 @@ async function evaluate(conn: Connection, book: TokenBook, onSignal: (b: TokenBo
   book.lastSignalAt = now; book.signals++; handling.add(book.symbol);
   console.log(
     fire
-      ? `${ts()} ⚡ ${book.symbol.padEnd(6)} LOCAL +${best.toFixed(1)} bps @ ${((sizeLamports ?? 0) / 1e9).toFixed(4)} SOL (buy ${bestBuy!.dex} → sell ${bestSell!.dex}, mid spread ${book.spreadBps.toFixed(0)})`
+      ? `${ts()} ⚡ ${book.symbol.padEnd(6)} LOCAL ${best >= 0 ? '+' : ''}${best.toFixed(1)} bps @ ${((sizeLamports ?? 0) / 1e9).toFixed(4)} SOL (buy ${bestBuy!.dex} → sell ${bestSell!.dex}, spread ${book.spreadBps.toFixed(0)}${bias ? `, jup-bias +${bias.toFixed(0)}` : ''})`
       : `${ts()} ⚡ ${book.symbol.padEnd(6)} mid spread ${book.spreadBps.toFixed(0)} bps but not locally priceable — one Jupiter look`,
   );
   try {
     const r = await onSignal(book);
     if (r) {
       book.lastJupEdge = r.edgeBps;
+      if (Number.isFinite(best)) {
+        const gap = r.edgeBps - best;
+        book.biasN = (book.biasN ?? 0) + 1;
+        book.biasBps = book.biasN === 1 ? gap : 0.7 * (book.biasBps ?? 0) + 0.3 * gap;
+      }
       const c = calibrateFromRoute(book, ...[r.legA, r.legB].filter((q): q is Quote => !!q));
       console.log(`    ${book.symbol}: jupiter ${r.edgeBps} bps vs local ${Number.isFinite(best) ? best.toFixed(1) : 'n/a'} bps${c ? ` | calibrated ${c}` : ''}`);
     }
@@ -316,7 +333,7 @@ export function watchSummary(): string {
   const parts: string[] = [];
   for (const b of books.values()) {
     const loc = Number.isFinite(b.localEdgeBps) ? b.localEdgeBps.toFixed(0) : 'n/a';
-    parts.push(`${b.symbol}:${loc}${b.lastJupEdge !== undefined ? `(j${b.lastJupEdge})` : ''}`);
+    parts.push(`${b.symbol}:${loc}${b.lastJupEdge !== undefined ? `(j${b.lastJupEdge})` : ''}${(b.biasN ?? 0) >= 2 && (b.biasBps ?? 0) > 5 ? `[+${(b.biasBps ?? 0).toFixed(0)}]` : ''}`);
   }
   return parts.join(' ');
 }
