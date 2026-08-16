@@ -61,7 +61,10 @@ export async function scanOnce(
     try {
       const legA = await quote(SOL, mint, inLamports);
       if (!legA) continue;
-      const legB = await quote(mint, SOL, BigInt(legA.outAmount));
+      // legB sells what legA GUARANTEES (its on-chain minimum), not what it
+      // expects — otherwise a fill even 1 unit short of the forecast leaves legB
+      // trying to transfer tokens we do not hold and the bundle dies for nothing.
+      const legB = await quote(mint, SOL, BigInt(legA.otherAmountThreshold));
       if (!legB) continue;
       const out = BigInt(legB.outAmount);
       const minOut = BigInt(legB.otherAmountThreshold);

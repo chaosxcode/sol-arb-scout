@@ -40,6 +40,11 @@ export const CFG = {
   // subset of Jupiter's routing graph; this is how far we let that gap lower the
   // bar for asking Jupiter, without letting one strange sample spam quotes.
   maxBiasBps: num('MAX_BIAS_BPS', 90),
+  // Periodic Jupiter comparison per token (2 requests) whenever it shows a real
+  // mid spread, so every token — including ones whose pools we build entirely
+  // locally — gets its blind spot measured. Budget: 17 tokens / 3 min ≈ 11 req/min.
+  probeSpreadBps: num('PROBE_SPREAD_BPS', 20),
+  probeIntervalMs: num('PROBE_INTERVAL_MS', 180_000),
   watchBlindBps: num('WATCH_BLIND_BPS', 150),     // not priceable locally but spread this big: one look
   watchCooldownMs: num('WATCH_COOLDOWN_MS', 4000),
   hotBps: num('HOT_BPS', -15),

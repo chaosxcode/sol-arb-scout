@@ -124,9 +124,13 @@ export async function buildPumpLegTx(
   if (side === 'buy') {
     ixs.push(SystemProgram.transfer({ fromPubkey: user, toPubkey: c.userQuote, lamports: amountIn }));
     ixs.push(createSyncNativeInstruction(c.userQuote, p.quoteTokenProgram));
-    ixs.push(pumpBuyIx(p, user, minOutOrBaseOut, amountIn, await pumpTemplate(conn, p, user, 'buy')));
+    const t = await pumpTemplate(conn, p, user, 'buy');
+    if (!t) throw new Error('pump template unavailable');
+    ixs.push(pumpBuyIx(p, user, minOutOrBaseOut, amountIn, t));
   } else {
-    ixs.push(pumpSellIx(p, user, amountIn, minOutOrBaseOut, await pumpTemplate(conn, p, user, 'sell')));
+    const t = await pumpTemplate(conn, p, user, 'sell');
+    if (!t) throw new Error('pump template unavailable');
+    ixs.push(pumpSellIx(p, user, amountIn, minOutOrBaseOut, t));
   }
   if (p.quoteMint.equals(NATIVE_MINT)) ixs.push(createCloseAccountInstruction(c.userQuote, user, user, [], p.quoteTokenProgram));
   ixs.push(...extraIxs);
@@ -266,13 +270,7 @@ export async function buildDlmmLegTx(
   const userTok = getAssociatedTokenAddressSync(tokenMint, user, false, tokenProg);
   const userWsol = getAssociatedTokenAddressSync(NATIVE_MINT, user, false, TOKEN_PROGRAM_ID);
   // bin arrays: active one plus the two in the direction the swap moves (skip ones that don't exist)
-  const solIn = side === 'buy';
-  const up = solIn === solIsY; // Y in => price rises => bin ids increase
-  const idx = Math.floor(p.activeId / 70);
-  const cand = up ? [idx, idx + 1, idx + 2] : [idx, idx - 1, idx - 2];
-  const pdas = cand.map((i) => dlmmBinArrayPda(p.pool, i));
-  const infos = await conn.getMultipleAccountsInfo(pdas);
-  const binArrays = pdas.filter((_, i) => !!infos[i]);
+  const binArrays = await dlmmBinArraysFor(conn, p, side === 'buy');
   const ixs: TransactionInstruction[] = [
     createAssociatedTokenAccountIdempotentInstruction(user, userTok, user, tokenMint, tokenProg),
     createAssociatedTokenAccountIdempotentInstruction(user, userWsol, user, NATIVE_MINT, TOKEN_PROGRAM_ID),
@@ -357,6 +355,7 @@ async function dlmmBinArraysFor(conn: Connection, p: DlmmPoolAccounts, solIn: bo
 async function swapIxFor(conn: Connection, a: LocalPoolAccts, user: PublicKey, userTok: PublicKey, userWsol: PublicKey, side: 'buy' | 'sell', amountIn: bigint, minOutOrBaseOut: bigint): Promise<TransactionInstruction> {
   if (a.kind === 'pump') {
     const t = await pumpTemplate(conn, a.p, user, side);
+    if (!t) throw new Error(`pump template unavailable for ${a.p.pool.toBase58().slice(0, 6)} — leg must go via Jupiter`);
     return side === 'buy' ? pumpBuyIx(a.p, user, minOutOrBaseOut, amountIn, t) : pumpSellIx(a.p, user, amountIn, minOutOrBaseOut, t);
   }
   if (a.kind === 'ray') return side === 'buy' ? rayV4SwapBaseInIx(a.p, user, userWsol, userTok, amountIn, minOutOrBaseOut) : rayV4SwapBaseInIx(a.p, user, userTok, userWsol, amountIn, minOutOrBaseOut);
@@ -564,18 +563,31 @@ async function jupiterPumpCpi(conn: Connection, inMint: string, outMint: string,
 
 // Exact PumpSwap accounts for this pool: buy from the live CPI; sell = buy minus the two
 // volume-accumulator slots ([19] global, [20] user), per the on-chain sell layout. Cached 5 min.
-export async function pumpTemplate(conn: Connection, p: PumpPoolAccounts, user: PublicKey, side: 'buy' | 'sell'): Promise<PumpTpl | null> {
+export async function pumpTemplate(conn: Connection, p: PumpPoolAccounts, user: PublicKey, side: 'buy' | 'sell', refresh = false): Promise<PumpTpl | null> {
   const key = p.pool.toBase58();
   const c = pumpTemplates.get(key);
-  if (c && Date.now() - c.at < 300_000 && c.buy) return side === 'buy' ? c.buy : c.sell ?? null;
+  if (!refresh && c && Date.now() - c.at < 300_000 && c.buy) return side === 'buy' ? c.buy : c.sell ?? null;
   const tokenMint = p.baseMint.equals(NATIVE_MINT) ? p.quoteMint : p.baseMint;
   try {
     const buy = await jupiterPumpCpi(conn, SOL_MINT, tokenMint.toBase58(), 10_000_000n, user);
-    if (!buy) return null;
+    if (!buy) {
+      // Fetch failed (rate limit, Jupiter hiccup): keep serving the previous
+      // template rather than dropping to "no template" — a slightly stale layout
+      // beats no local build, and the next refresh will retry.
+      return c?.buy ? (side === 'buy' ? c.buy : c.sell ?? null) : null;
+    }
     const sell: PumpTpl = { keys: buy.keys.filter((_, i) => i !== 19 && i !== 20), writable: buy.writable.filter((_, i) => i !== 19 && i !== 20) };
     pumpTemplates.set(key, { at: Date.now(), buy, sell });
     return side === 'buy' ? buy : sell;
-  } catch { return null; }
+  } catch { return c?.buy ? (side === 'buy' ? c.buy : c.sell ?? null) : null; }
+}
+// True when a fresh CPI template exists for this pool. Without one we do NOT
+// build a PumpSwap leg locally: the hand-written legacy layout is known-stale
+// (PumpSwap changed its instruction mid-session on 2026-08-15) and would only
+// waste a send. Callers route that leg through Jupiter instead.
+export function hasPumpTemplate(pool: PublicKey): boolean {
+  const c = pumpTemplates.get(pool.toBase58());
+  return !!c?.buy && Date.now() - c.at < 900_000;
 }
 export function pumpTemplateSizes(): string { return [...pumpTemplates.entries()].map(([k, v]) => `${k.slice(0, 6)}:${v.buy ? 'B' : '-'}${v.sell ? 'S' : '-'}`).join(' '); }
 
@@ -585,9 +597,10 @@ export async function warmPumpTemplates(conn: Connection, user: PublicKey, pools
     if (p.dex !== 'pumpswap') continue;
     try {
       const acc = await loadPumpPool(conn, p.address);
-      if (force) pumpTemplates.delete(acc.pool.toBase58());
-      const t = await pumpTemplate(conn, acc, user, 'buy');
-      console.log(`  pump template ${p.address.toBase58().slice(0, 6)}…: ${t ? `${t.keys.length} accts` : 'FAILED (will fall back to legacy layout)'}`);
+      // Replace-on-success: the old template stays live until the new one lands,
+      // so a refresh never opens a window where the leg has no template.
+      const t = await pumpTemplate(conn, acc, user, 'buy', force);
+      console.log(`  pump template ${p.address.toBase58().slice(0, 6)}…: ${t ? `${t.keys.length} accts` : 'FAILED — this pool's pump legs go via Jupiter until the next refresh'}`);
     } catch (e) { console.warn(`  pump template ${p.address.toBase58().slice(0, 6)}… failed: ${(e as Error).message.slice(0, 80)}`); }
     await new Promise((r) => setTimeout(r, 1200));
   }

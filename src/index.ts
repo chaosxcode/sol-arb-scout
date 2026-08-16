@@ -4,12 +4,12 @@ import { CFG } from './config.js';
 import { scanOnce, tierCounts, type Opportunity } from './scanner.js';
 import { laneStats, quote, type Quote } from './jupiter.js';
 import { SOL, TOKENS } from './tokens.js';
-import { startWatcher, addToken, dropToken, watchSummary, books, localRoundTrip, type TokenBook, type SignalResult } from './watch.js';
+import { startWatcher, addToken, dropToken, watchSummary, books, localRoundTrip, type TokenBook, type SignalResult, type SignalMode } from './watch.js';
 import { screenTokens } from './discover.js';
 import { swapOut, modelOf } from './pools.js';
-import { isLocalDex, loadLocalPool, staticKeysFor, warmPumpTemplates } from './build.js';
+import { isLocalDex, loadLocalPool, staticKeysFor, warmPumpTemplates, hasPumpTemplate } from './build.js';
 import { ensureAlt } from './alt.js';
-import { startBlockhashPump, blockhashAgeMs } from './hot.js';
+import { startBlockhashPump, blockhashAgeMs, startBalancePump, hotBalance, nudgeBalance } from './hot.js';
 import { startWire } from './wire.js';
 import {
   BASE_FEES_LAMPORTS,
@@ -33,6 +33,20 @@ async function lockedRent(conn: Connection, wallet: { publicKey: import('@solana
 }
 const ts = () => new Date().toISOString().slice(11, 19);
 
+// SOL value of a raw token amount, from the watcher's live pool prices. null if
+// we do not price this mint (then the sweeper leaves any non-trivial balance alone).
+function valueSol(mint: string, rawAmount: bigint): number | null {
+  for (const b of books.values()) {
+    if (b.mint !== mint) continue;
+    const priced = b.pools.filter((p) => p.ok && p.price && p.price > 0);
+    if (!priced.length) return null;
+    const px = Math.max(...priced.map((p) => p.price!)); // SOL per whole token, UI units
+    const dec = priced[0].decimals;
+    return (Number(rawAmount) / 10 ** dec) * px;
+  }
+  return null;
+}
+
 async function main() {
   console.log(
     `sol-arb-scout | mode=${CFG.dryRun ? 'DRY RUN (paper)' : 'LIVE'} | ` +
@@ -50,12 +64,14 @@ async function main() {
   const conn = new Connection(CFG.rpcUrl, 'confirmed');
   startWire();              // warm TLS sockets to every Jito region (~100ms off each submit)
   startBlockhashPump(conn); // keeps a fresh blockhash ready so firing costs no RPC
+  setInterval(() => void getTipFloor(), 15_000); // keep the tip floor cache warm (it caches 20s)
   const wallet = CFG.dryRun ? null : loadWallet();
   let startBal = 0;
   if (wallet) {
     // Reclaim any rent left over from earlier runs, then baseline the balance.
-    await reclaimEmptyTokenAccounts(conn, wallet).catch(() => 0);
+    await reclaimEmptyTokenAccounts(conn, wallet, undefined, valueSol).catch(() => 0);
     startBal = await conn.getBalance(wallet.publicKey);
+    startBalancePump(conn, wallet.publicKey); // firing path reads a cached balance, never RPC
     console.log(`wallet ${wallet.publicKey.toBase58()} | balance ${fmtSol(startBal)} SOL`);
   }
   const floor0 = await getTipFloor();
@@ -64,12 +80,17 @@ async function main() {
   // On-chain signal: a token's live cross-pool spread crossed its trigger.
   // Ask Jupiter for the executable round trip *now* and run the same gate.
   // Hybrid: a PumpSwap leg is built locally (no API call); other legs via Jupiter.
-  const onSignal = async (book: TokenBook): Promise<SignalResult> => {
+  const onSignal = async (book: TokenBook, mode: SignalMode = 'local'): Promise<SignalResult> => {
     // Size chosen by the local optimiser for THIS dislocation (capped by TRADE_SIZE_SOL).
     const inL = BigInt(book.localSizeLamports ?? Math.floor(CFG.tradeSizeSol * 1e9));
     const slip = (x: bigint) => (x * BigInt(10_000 - CFG.slippageBps)) / 10_000n;
-    const buyLocal = CFG.localBuild && !!book.localBuy && isLocalDex(book.localBuy.dex, book.localBuy.token2022);
-    const sellLocal = CFG.localBuild && !!book.localSell && isLocalDex(book.localSell.dex, book.localSell.token2022);
+    // A leg is built locally only if (a) we're in local mode, (b) the venue is one
+    // we encode for this token standard, and (c) for PumpSwap, a fresh CPI
+    // template exists — otherwise the leg goes to Jupiter, never to a stale layout.
+    const canLocal = (p: typeof book.localBuy) =>
+      !!p && CFG.localBuild && mode === 'local' && isLocalDex(p.dex, p.token2022) && (p.dex !== 'pumpswap' || hasPumpTemplate(p.address));
+    const buyLocal = canLocal(book.localBuy);
+    const sellLocal = canLocal(book.localSell);
     let legA: Quote | null = null, tokAmount: bigint;
     if (buyLocal) {
       const t = swapOut(book.localBuy!, SOL, Number(inL));
@@ -84,8 +105,12 @@ async function main() {
     // legA's on-chain minimum, so it needs a real buffer (BUY_BUFFER_BPS) or the
     // buy reverts on any tick of movement — which is what killed several fires.
     // Profitability is then judged on this reduced amount, so the gate stays honest.
+    // This applies to a Jupiter-built legA too: its quoted outAmount is an
+    // expectation, and legB transfers exactly what we say — so legB must be sized
+    // to what legA is guaranteed to deliver, and the executor loosens legA's
+    // on-chain minimum to that same buffered amount.
     const buf = (x: bigint) => (x * BigInt(10_000 - CFG.buyBufferBps)) / 10_000n;
-    const sellIn = buyLocal ? buf(tokAmount) : tokAmount;
+    const sellIn = buf(tokAmount);
     let legB: Quote | null = null, out: bigint, minOut: bigint;
     if (sellLocal) {
       const o = swapOut(book.localSell!, book.mint, Number(sellIn));
@@ -124,9 +149,10 @@ async function main() {
         }
         setAlt(await ensureAlt(conn, wallet, keys));
         // PumpSwap CPI templates (from Jupiter+simulation): warm now, refresh every 4 min.
-        const pumpPools = [...books.values()].flatMap((b) => b.pools.filter((p) => p.dex === 'pumpswap'));
-        await warmPumpTemplates(conn, wallet.publicKey, pumpPools);
-        setInterval(() => void warmPumpTemplates(conn, wallet.publicKey, pumpPools, true), 240_000);
+        const livePumpPools = () => [...books.values()].flatMap((b) => b.pools.filter((p) => p.dex === 'pumpswap'));
+        await warmPumpTemplates(conn, wallet.publicKey, livePumpPools());
+        // Refresh over the LIVE list so pools adopted by rotation are covered too.
+        setInterval(() => void warmPumpTemplates(conn, wallet.publicKey, livePumpPools(), true), 240_000);
 
         // ---- hourly token rotation, ranked by fee wall ----
         // The long tail is where tradeable edges actually exist and it turns over,
@@ -146,6 +172,9 @@ async function main() {
                 if (await addToken(conn, sym, c.mint, onSignal)) {
                   added++;
                   console.log(`  rotation + ${sym}: fee wall ${c.wall.toFixed(0)} bps, ${c.pools} pools, $${(c.liqUsd / 1e6).toFixed(1)}M liq`);
+                  // New PumpSwap pools need their CPI template before they can build locally.
+                  const b = books.get(sym);
+                  if (b) await warmPumpTemplates(conn, wallet.publicKey, b.pools.filter((p) => p.dex === 'pumpswap'));
                 }
               }
               // Make room by dropping the worst performers (no signals, worst edge).
@@ -234,7 +263,10 @@ async function main() {
     // Parallel trades must not overdraw the wallet: reserve this trade's input
     // (plus fees/tip headroom) against the free balance before firing.
     const need = Number(opp.inLamports) + plan.tipLamports + BASE_FEES_LAMPORTS + 5_000_000; // keep ~0.005 SOL spare
-    const free = (await conn.getBalance(wallet.publicKey).catch(() => 0)) - committedLamports;
+    // Cached balance (background pump) — no RPC round trip in the firing path.
+    // If the pump has never succeeded (-1), fall back to one live read.
+    const known = hotBalance();
+    const free = (known >= 0 ? known : await conn.getBalance(wallet.publicKey).catch(() => 0)) - committedLamports;
     if (free < need) { console.log(`  (${opp.symbol} skipped: ${fmtSol(free)} SOL free vs ${fmtSol(need)} needed with ${inflightByToken.size} in flight)`); return; }
     committedLamports += need;
     inflightByToken.add(opp.symbol);
@@ -244,7 +276,7 @@ async function main() {
       if (res.status !== 'sent') { console.log(`  ✗ ${res.detail}`); inflightByToken.delete(opp.symbol); committedLamports -= need; return; }
       res.landing!
         .then(async (fin) => {
-          if (fin.status === 'landed') { landed++; console.log(`  ✅ LANDED ${opp.symbol} (${fin.detail})`); await reportBalance(true); }
+          if (fin.status === 'landed') { landed++; console.log(`  ✅ LANDED ${opp.symbol} (${fin.detail})`); nudgeBalance(conn, wallet.publicKey); await reportBalance(true); }
           else if (fin.status === 'dropped') console.log(`  ✗ ${opp.symbol} bundle not landed — lost the race, cost 0`);
           else console.log(`  ✗ ${opp.symbol}: ${fin.detail}`);
         })
@@ -275,7 +307,7 @@ async function main() {
         const needBps = Math.ceil((need * 10_000) / sizeRef) + CFG.slippageBps;
         let bal = '';
         if (wallet) {
-          if (scans % 200 === 0) await reclaimEmptyTokenAccounts(conn, wallet).catch(() => 0);
+          if (scans % 200 === 0) { await reclaimEmptyTokenAccounts(conn, wallet, undefined, valueSol).catch(() => 0); nudgeBalance(conn, wallet.publicKey); }
           try {
             const b = await conn.getBalance(wallet.publicKey);
             const rent = await lockedRent(conn, wallet);

@@ -6,6 +6,7 @@
 // disabled if the decode disagrees, so a wrong offset can't fire a trade.
 import { Connection, PublicKey } from '@solana/web3.js';
 import { SOL } from './tokens.js';
+import { noteBinArray } from './build.js';
 
 export type Dex = 'pumpswap' | 'raydium-v4' | 'raydium-clmm' | 'orca-wp' | 'meteora-dlmm';
 
@@ -319,6 +320,7 @@ export async function ensureBinArrays(conn: Connection, p: Pool, maxAgeMs = 1500
       }
     } // missing array = no liquidity there (bins stay empty)
     m.dlmm!.arrays.set(i, { at: Date.now(), bins });
+    noteBinArray(p.address, i, !!info); // keep the tx builder's view of existing arrays fresh
   });
   return true;
 }

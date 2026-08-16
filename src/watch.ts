@@ -40,6 +40,7 @@ export interface TokenBook {
   // filtering out opportunities we simply cannot see locally.
   biasBps?: number;   // EMA of (jupiter edge - local edge)
   biasN?: number;
+  lastProbeAt?: number;
 }
 
 export const books = new Map<string, TokenBook>();
@@ -53,6 +54,12 @@ async function mintInfo(conn: Connection, mint: string): Promise<{ decimals: num
 }
 
 export type SignalResult = { edgeBps: number; legA?: Quote; legB?: Quote } | null;
+// How a signal should be handled:
+//   'local' — our own math says it's tradeable: build the local round trip.
+//   'jupiter' — our math is (or may be) blind here: ask Jupiter for the full
+//               round trip, trade it if it clears the gate, and use the answer
+//               to learn how far off our local view is on this token.
+export type SignalMode = 'local' | 'jupiter';
 
 // Bring one token under live watch: discover its pools, validate decoders,
 // build local price models, subscribe. Safe to call at runtime — this is what
@@ -61,7 +68,7 @@ export async function addToken(
   conn: Connection,
   symbol: string,
   mint: string,
-  onSignal: (book: TokenBook) => Promise<SignalResult>,
+  onSignal: (book: TokenBook, mode: SignalMode) => Promise<SignalResult>,
 ): Promise<boolean> {
   if (books.has(symbol)) return false;
   const before = books.size;
@@ -79,7 +86,7 @@ export function dropToken(conn: Connection, symbol: string): boolean {
 
 export async function startWatcher(
   conn: Connection,
-  onSignal: (book: TokenBook) => Promise<SignalResult>,
+  onSignal: (book: TokenBook, mode: SignalMode) => Promise<SignalResult>,
 ): Promise<void> {
   for (const [symbol, mint] of Object.entries(TOKENS)) await watchOne(conn, symbol, mint, onSignal);
   console.log(`watcher: ${books.size} tokens priced locally, ${[...books.values()].reduce((n, b) => n + b.pools.length, 0)} pools, ${[...books.values()].reduce((n, b) => n + (b.subIds?.length ?? 0), 0)} subscriptions`);
@@ -91,7 +98,7 @@ async function watchOne(
   conn: Connection,
   symbol: string,
   mint: string,
-  onSignal: (book: TokenBook) => Promise<SignalResult>,
+  onSignal: (book: TokenBook, mode: SignalMode) => Promise<SignalResult>,
 ): Promise<void> {
   let subs = 0, okPools = 0, badPools = 0;
   {
@@ -186,7 +193,7 @@ async function warmStartupCalibration(conn: Connection): Promise<void> {
 const handling = new Set<string>();
 let ready = false; // stage-2 signals wait until startup calibration is done
 
-async function evaluate(conn: Connection, book: TokenBook, onSignal: (b: TokenBook) => Promise<SignalResult>, quiet = false): Promise<void> {
+async function evaluate(conn: Connection, book: TokenBook, onSignal: (b: TokenBook, mode: SignalMode) => Promise<SignalResult>, quiet = false): Promise<void> {
   const live = book.pools.filter((p) => p.ok && p.price && p.price > 0);
   if (live.length < 2) return;
   // Stage 1
@@ -207,26 +214,43 @@ async function evaluate(conn: Connection, book: TokenBook, onSignal: (b: TokenBo
   // N bps better than ours on this token, a local reading of (trigger - N) is
   // worth a Jupiter check. Bounded so a single odd sample can't open the floodgates.
   const bias = (book.biasN ?? 0) >= 2 ? Math.max(0, Math.min(CFG.maxBiasBps, book.biasBps ?? 0)) : 0;
-  const effTrigger = CFG.localTriggerBps - bias;
-  const fire = Number.isFinite(best) && best >= effTrigger;
-  // Fallback: can't price locally but the mid spread is huge — still worth one look, rarely.
+  // Four reasons to act, in priority order:
+  //   local  — our own exact math clears the trigger: build it ourselves.
+  //   bias   — our math is short of the trigger, but Jupiter has repeatedly found
+  //            routes N bps better on this token: ask Jupiter for the round trip.
+  //   blind  — we cannot price it at all but the mid spread is huge: one look.
+  //   probe  — a periodic Jupiter look at a token with a real spread, purely to
+  //            MEASURE how blind we are (this is where bias comes from — without
+  //            it, tokens whose pools are all locally-buildable never get a
+  //            Jupiter comparison and their blind spot is never discovered).
+  const localFire = Number.isFinite(best) && best >= CFG.localTriggerBps;
+  const biasFire = !localFire && Number.isFinite(best) && bias > 0 && best >= CFG.localTriggerBps - bias;
   const blind = !Number.isFinite(best) && book.spreadBps >= CFG.watchBlindBps && now - book.lastSignalAt > 30_000;
-  if (!fire && !blind) return;
-  if (now - book.lastSignalAt < CFG.watchCooldownMs) return;
-  book.lastSignalAt = now; book.signals++; handling.add(book.symbol);
-  console.log(
-    fire
-      ? `${ts()} ⚡ ${book.symbol.padEnd(6)} LOCAL ${best >= 0 ? '+' : ''}${best.toFixed(1)} bps @ ${((sizeLamports ?? 0) / 1e9).toFixed(4)} SOL (buy ${bestBuy!.dex} → sell ${bestSell!.dex}, spread ${book.spreadBps.toFixed(0)}${bias ? `, jup-bias +${bias.toFixed(0)}` : ''})`
-      : `${ts()} ⚡ ${book.symbol.padEnd(6)} mid spread ${book.spreadBps.toFixed(0)} bps but not locally priceable — one Jupiter look`,
+  const probe = !localFire && !biasFire && !blind && book.spreadBps >= CFG.probeSpreadBps
+    && now - (book.lastProbeAt ?? 0) > CFG.probeIntervalMs;
+  if (!localFire && !biasFire && !blind && !probe) return;
+  if (!probe && now - book.lastSignalAt < CFG.watchCooldownMs) return;
+  const mode: SignalMode = localFire ? 'local' : 'jupiter';
+  if (probe) book.lastProbeAt = now; else { book.lastSignalAt = now; book.signals++; }
+  handling.add(book.symbol);
+  if (!probe) console.log(
+    localFire
+      ? `${ts()} ⚡ ${book.symbol.padEnd(6)} LOCAL +${best.toFixed(1)} bps @ ${((sizeLamports ?? 0) / 1e9).toFixed(4)} SOL (buy ${bestBuy!.dex} → sell ${bestSell!.dex}, spread ${book.spreadBps.toFixed(0)})`
+      : biasFire
+        ? `${ts()} ⚡ ${book.symbol.padEnd(6)} local ${best.toFixed(1)} bps but Jupiter runs ~+${bias.toFixed(0)} better here (spread ${book.spreadBps.toFixed(0)}) — asking Jupiter`
+        : `${ts()} ⚡ ${book.symbol.padEnd(6)} mid spread ${book.spreadBps.toFixed(0)} bps but not locally priceable — one Jupiter look`,
   );
   try {
-    const r = await onSignal(book);
+    const r = await onSignal(book, mode);
     if (r) {
       book.lastJupEdge = r.edgeBps;
-      if (Number.isFinite(best)) {
+      // Learn the blind spot ONLY from a genuine Jupiter answer. In 'local' mode
+      // r.edgeBps is our own number again and would just drag the estimate to 0.
+      if (mode === 'jupiter' && Number.isFinite(best)) {
         const gap = r.edgeBps - best;
         book.biasN = (book.biasN ?? 0) + 1;
         book.biasBps = book.biasN === 1 ? gap : 0.7 * (book.biasBps ?? 0) + 0.3 * gap;
+        if (probe && Math.abs(gap) >= 15) console.log(`${ts()} probe ${book.symbol.padEnd(6)} local ${best.toFixed(0)} vs jupiter ${r.edgeBps} bps (gap ${gap >= 0 ? '+' : ''}${gap.toFixed(0)}, bias now ${(book.biasBps ?? 0).toFixed(0)})`);
       }
       const c = calibrateFromRoute(book, ...[r.legA, r.legB].filter((q): q is Quote => !!q));
       console.log(`    ${book.symbol}: jupiter ${r.edgeBps} bps vs local ${Number.isFinite(best) ? best.toFixed(1) : 'n/a'} bps${c ? ` | calibrated ${c}` : ''}`);

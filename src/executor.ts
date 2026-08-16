@@ -18,7 +18,7 @@ import { readFileSync } from 'node:fs';
 import { CFG } from './config.js';
 import { buildSwapTx } from './jupiter.js';
 import { sendBundle, TIP_ACCOUNTS, type TipFloor } from './jito.js';
-import { isLocalDex, loadLocalPool, buildRoundTripTx, buildLegTx } from './build.js';
+import { isLocalDex, loadLocalPool, buildRoundTripTx, buildLegTx, hasPumpTemplate } from './build.js';
 import { hotBlockhash } from './hot.js';
 import type { Opportunity } from './scanner.js';
 
@@ -107,8 +107,10 @@ export async function execute(
   // Each leg is built either LOCALLY (PumpSwap, src/build.ts — zero API calls)
   // or by Jupiter. legA: no priority fee. legB carries the Jito tip (embedded
   // by Jupiter, or an explicit transfer appended to a local tx).
-  const localA = CFG.localBuild && !opp.legA && !!opp.localBuy && isLocalDex(opp.localBuy.dex, opp.localBuy.token2022);
-  const localB = CFG.localBuild && !opp.legB && !!opp.localSell && isLocalDex(opp.localSell.dex, opp.localSell.token2022);
+  const okLocal = (p: NonNullable<Opportunity['localBuy']>) =>
+    isLocalDex(p.dex, p.token2022) && (p.dex !== 'pumpswap' || hasPumpTemplate(p.address));
+  const localA = CFG.localBuild && !opp.legA && !!opp.localBuy && okLocal(opp.localBuy);
+  const localB = CFG.localBuild && !opp.legB && !!opp.localSell && okLocal(opp.localSell);
   if ((!opp.legA && !localA) || (!opp.legB && !localB)) return { status: 'error', detail: 'no way to build a leg' };
   // ---- On-chain minimum-out: the BREAK-EVEN floor, not a tight track of our estimate.
   // We were setting min-out to (local estimate - SLIPPAGE_BPS), so a trade died if
@@ -129,8 +131,12 @@ export async function execute(
   // on any tick of movement. Rewrite the threshold on the FINAL leg to the same
   // break-even floor we use for local legs: revert only if we'd lose money.
   const legBForBuild = opp.legB && !localB ? relaxThreshold(opp.legB, floorOut) : opp.legB;
+  // A Jupiter legA must guarantee at least what legB will sell (the buffered
+  // amount); its default 1-bp minimum is tighter than that and reverts for no
+  // reason. Loosen it to the buffered amount — never below what legB needs.
+  const legAForBuild = opp.legA && !localA && opp.tokAmount ? relaxThreshold(opp.legA, slip(opp.tokAmount)) : opp.legA;
   const [aRes, bRes, bh] = await Promise.all([
-    localA ? null : buildSwapTx(opp.legA!, user, 0),
+    localA ? null : buildSwapTx(legAForBuild!, user, 0),
     localB ? null : buildSwapTx(legBForBuild!, user, { jitoTipLamports: plan.tipLamports }),
     bhP,
   ]);
@@ -283,6 +289,9 @@ export async function reclaimEmptyTokenAccounts(
   conn: Connection,
   wallet: Keypair,
   onlyMint?: string,
+  // SOL value of a raw amount, if we can price it. Used to decide whether a
+  // leftover balance is dust worth burning to free the rent, or a real position.
+  valueSol?: (mint: string, rawAmount: bigint) => number | null,
 ): Promise<number> {
   let reclaimed = 0;
   for (const programId of [TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID]) {
@@ -292,9 +301,13 @@ export async function reclaimEmptyTokenAccounts(
       if (onlyMint && info.mint.toBase58() !== onlyMint) continue;
       const tx = new Transaction();
       if (info.amount > 0n) {
-        // Dust worth < a fee: burn so the account can close. (Real balances are
-        // never touched: anything above 0.0001 SOL-equivalent is left alone.)
-        if (info.amount > 1_000_000n) continue; // suspiciously large — leave it
+        // Burn only genuine dust. Judged by VALUE when we can price the mint
+        // (below a quarter of the ~0.002 SOL rent it frees), and otherwise only
+        // if the raw amount is trivially small — a raw-unit threshold alone was
+        // unsafe: 1e6 raw of a 6-decimal $1 token is a dollar, not dust.
+        const v = valueSol?.(info.mint.toBase58(), info.amount) ?? null;
+        const isDust = v !== null ? v < 0.0005 : info.amount <= 1_000n;
+        if (!isDust) { console.log(`  leaving ${info.mint.toBase58().slice(0, 6)}… balance ${info.amount} raw${v !== null ? ` (~${v.toFixed(5)} SOL)` : ''} — not dust`); continue; }
         tx.add(createBurnInstruction(pubkey, info.mint, wallet.publicKey, info.amount, [], programId));
       }
       tx.add(createCloseAccountInstruction(pubkey, wallet.publicKey, wallet.publicKey, [], programId));

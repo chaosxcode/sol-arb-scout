@@ -34,3 +34,24 @@ export async function hotBlockhash(conn: Connection): Promise<string> {
   return blockhash;
 }
 export const blockhashAgeMs = () => (blockhashAt ? Date.now() - blockhashAt : -1);
+
+// ---- Wallet balance, kept warm ---------------------------------------------
+// onCandidate needs the free balance to size its capital guard. Reading it over
+// RPC at fire time put a 50-100ms round trip back into the critical path.
+let balanceLamports = -1;
+let balanceAt = 0;
+let balTimer: NodeJS.Timeout | null = null;
+export function startBalancePump(conn: Connection, owner: import('@solana/web3.js').PublicKey, intervalMs = 4000): void {
+  if (balTimer) return;
+  const tick = async () => {
+    try { balanceLamports = await conn.getBalance(owner, 'confirmed'); balanceAt = Date.now(); } catch { /* keep last */ }
+  };
+  void tick();
+  balTimer = setInterval(() => void tick(), intervalMs);
+}
+export function hotBalance(): number { return balanceLamports; }
+export const balanceAgeMs = () => (balanceAt ? Date.now() - balanceAt : -1);
+// Call after a landed trade or sweep so the guard sees the new number at once.
+export function nudgeBalance(conn: Connection, owner: import('@solana/web3.js').PublicKey): void {
+  void conn.getBalance(owner, 'confirmed').then((b) => { balanceLamports = b; balanceAt = Date.now(); }).catch(() => {});
+}
